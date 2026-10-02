@@ -1,0 +1,64 @@
+use async_trait::async_trait;
+pub use cloud_object_models::{CloudFolder, CloudFolderModel};
+// Re-exported from warp_server_client.
+pub use warp_server_client::ids::FolderId;
+
+use crate::cloud_object::CloudObjectTypeAndId;
+use crate::cloud_object::{CloudModelType, CloudObjectUpsertParams, ObjectType, Space};
+use crate::persistence::ModelEvent;
+use crate::server::ids::SyncId;
+use cloud_objects::cloud_object::SerializedModel;
+
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+impl CloudModelType for CloudFolderModel {
+    type CloudObjectType = CloudFolder;
+    type IdType = FolderId;
+
+    fn model_type_name(&self) -> &'static str {
+        "Folder"
+    }
+
+    fn object_type(&self) -> ObjectType {
+        ObjectType::Folder
+    }
+
+    fn cloud_object_type_and_id(&self, id: SyncId) -> CloudObjectTypeAndId {
+        CloudObjectTypeAndId::Folder(id)
+    }
+
+    fn display_name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn upsert_event(params: CloudObjectUpsertParams<Self>) -> ModelEvent {
+        ModelEvent::UpsertFolder {
+            folder: CloudFolder::from(params),
+        }
+    }
+
+    fn bulk_upsert_event(objects: Vec<CloudObjectUpsertParams<Self>>) -> ModelEvent {
+        ModelEvent::UpsertFolders(objects.into_iter().map(CloudFolder::from).collect())
+    }
+
+    fn should_update_after_server_conflict(&self) -> bool {
+        false
+    }
+
+    fn serialized(&self) -> SerializedModel {
+        SerializedModel::new(self.name.to_owned())
+    }
+
+    fn can_move_to_space(&self, current_space: Space, new_space: Space) -> bool {
+        // We don't currently support moving folders across spaces.
+        current_space == new_space
+    }
+
+    fn supports_linking(&self) -> bool {
+        true
+    }
+
+    fn renders_in_warp_drive(&self) -> bool {
+        true
+    }
+}

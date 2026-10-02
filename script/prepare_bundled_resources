@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+#
+# Prepares bundled resources for distribution.
+#
+# This script copies resources that should be bundled with Warp into a
+# destination directory. It is used by macOS and Linux build scripts.
+#
+# Usage:
+#   prepare_bundled_resources <destination_directory> [channel] [cargo_profile] [cargo_target]
+#
+# Arguments:
+#   destination_directory:  The directory where resources should be installed.
+#                           Resources will be copied to subdirectories within
+#                           this path (e.g., $DEST_DIR/skills).
+#   channel:                (Optional) Release channel (local, dev, preview,
+#                           stable). Used to include channel-gated skills.
+#   cargo_profile:          (Optional) Cargo build profile to use when
+#                           generating the settings schema. Reusing the same
+#                           profile as the main build avoids recompiling deps.
+#   cargo_target:           (Optional) Cargo target triple to use when
+#                           generating the settings schema.
+#   cargo_features:         (Optional) Cargo feature list to use when
+#                           generating the settings schema. See the LOCAL FORK
+#                           note at the schema step for why these two matter.
+#
+# Environment variables:
+#   SKIP_SETTINGS_SCHEMA: Set to "1" to skip generating the JSON settings
+#                         schema. By default the schema is always generated
+#                         so that production bundles never accidentally omit it.
+#   SETTINGS_SCHEMA_CACHE: Path to a cache file for the generated schema.
+#                          When set, the first invocation generates the schema
+#                          and saves a copy to this path; subsequent invocations
+#                          copy from the cache instead of regenerating. This
+#                          avoids redundant compilations when bundling multiple
+#                          package formats for the same channel.
+
+set -e
+
+if [ $# -lt 1 ] || [ $# -gt 5 ]; then
+  echo "Error: Expected 1-5 arguments but received $#" >&2
+  echo "Usage: $0 <destination_directory> [channel] [cargo_profile] [cargo_target] [cargo_features]" >&2
+  exit 1
+fi
+
+DEST_DIR="$1"
+CHANNEL="${2:-}"
+CARGO_PROFILE="${3:-}"
+CARGO_TARGET="${4:-}"
+CARGO_FEATURES="${5:-}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+RESOURCES_SRC="$REPO_ROOT/resources"
+
+# Validate that the source resources directory exists
+if [ ! -d "$RESOURCES_SRC" ]; then
+  echo "Error: Resources directory not found at $RESOURCES_SRC" >&2
+  exit 1
+fi
+
+# Create the destination directory if it doesn't exist
+mkdir -p "$DEST_DIR"
+
+# Copy bundled resources
+if [ -d "$RESOURCES_SRC/bundled" ]; then
+  echo "Copying bundled resources to $DEST_DIR/bundled"
+  rm -rf "$DEST_DIR/bundled"
+  cp -R "$RESOURCES_SRC/bundled" "$DEST_DIR/bundled"
+else
+  echo "Warning: No bundled directory found at $RESOURCES_SRC/bundled" >&2
+fi
+
+if [ -n "$GIT_RELEASE_TAG" ]; then
+  VERSION_METADATA_DIR="$DEST_DIR/bundled/metadata"
+  VERSION_METADATA_PATH="$VERSION_METADATA_DIR/version.json"
+
+  echo "Writing bundled Warp version metadata to $VERSION_METADATA_PATH"
+  mkdir -p "$VERSION_METADATA_DIR"
+  printf '{\n  "warp_version": "%s"\n}\n' "$GIT_RELEASE_TAG" > "$VERSION_METADATA_PATH"
+fi
+
+# Copy channel-gated skills matching the current release channel.
+GATED_SRC="$REPO_ROOT/resources/channel-gated-skills"
+DEST_SKILLS="$DEST_DIR/bundled/skills"
+
+if [ -n "$CHANNEL" ] && [ -d "$GATED_SRC" ]; then
+  echo "Copying channel-gated skills for channel '$CHANNEL'..."
+  "$SCRIPT_DIR/copy_conditional_skills" \
+    "$CHANNEL" \
+    "$GATED_SRC" \
+    "$DEST_SKILLS"
+fi
+
+# Generate third-party license attribution.
+#
+# Additional (non-Cargo) third-party license files to include in the output.
+# Each entry is: "Component Name|License Identifier|path/to/LICENSE/relative/to/repo/root"
+# When adding a new third-party component to the bundle, add its license file
+# to the repo alongside the component and add an entry here.
+ADDITIONAL_LICENSES=(
+    "Alacritty (alacritty_terminal)|Apache-2.0|crates/warp_terminal/src/model/LICENSE-ALACRITTY"
+    "Hack Font|MIT|app/assets/bundled/fonts/hack/LICENSE.md"
+    "Roboto Font|SIL Open Font License|app/assets/bundled/fonts/roboto/LICENSE.txt"
+    "bash-preexec|MIT|app/assets/bundled/bootstrap/bash-preexec-LICENSE.md"
+    "Claude API Skill|Apache-2.0|resources/bundled/skills/claude-api/LICENSE.txt"
+    # LOCAL FORK: the `rudder-sdk-rust` entry went with the Rudderstack telemetry
+    # pipeline. Its licence file lived beside the vendored code at
+    # `app/src/server/telemetry/LICENSE-RUDDER-SDK-RUST.txt` and was deleted with it,
+    # which made this loop's missing-file check abort the bundle before codesigning.
+    # Nothing SDK-derived ships any more, so the attribution goes rather than the check.
+    "Windows Terminal|MIT|app/assets/windows/LICENSE-WINDOWS-TERMINAL"
+    "GitHub Desktop|MIT|app/src/code_review/GITHUB-DESKTOP-LICENSE"
+)
+
+# Build the third-party licenses file unless the NO_LICENSES envvar is set.
+#
+# LOCAL FORK: skip with a warning when cargo-about is not installed, rather than
+# aborting. `cargo about` failing here used to kill the whole bundle script, and
+# because license generation runs *before* the codesigning steps, every local
+# build silently ended up unsigned — the executable kept the ad-hoc signature the
+# linker applies on arm64 while the bundle had no sealed resources, which macOS
+# treats as corrupt and refuses to launch cleanly. A missing attribution file is
+# not a good reason to produce an unlaunchable app.
+#
+# Install it with `script/install_cargo_release_deps` (or
+# `cargo install --locked cargo-about@0.8.4`). Attribution is required for
+# redistribution, so this is a local-convenience fallback, not a licence to ship
+# without it.
+if [ -z "$NO_LICENSES" ] && ! cargo about --version >/dev/null 2>&1; then
+  echo "WARNING: cargo-about is not installed; skipping THIRD_PARTY_LICENSES.txt." >&2
+  echo "         Install it with script/install_cargo_release_deps before distributing." >&2
+  NO_LICENSES=1
+fi
+
+if [ -z "$NO_LICENSES" ]; then
+  LICENSES_OUTPUT="$DEST_DIR/THIRD_PARTY_LICENSES.txt"
+  echo "Generating third-party licenses at $LICENSES_OUTPUT"
+  cargo about generate \
+      --workspace \
+      --manifest-path "$REPO_ROOT/Cargo.toml" \
+      -c "$REPO_ROOT/about.toml" \
+      -o "$LICENSES_OUTPUT" \
+      "$REPO_ROOT/about.hbs"
+
+  # Append additional (non-Cargo) third-party licenses.
+  for entry in "${ADDITIONAL_LICENSES[@]}"; do
+      IFS='|' read -r name license_id license_path <<< "$entry"
+      license_file="$REPO_ROOT/$license_path"
+      if [ ! -f "$license_file" ]; then
+          echo "Error: License file not found: $license_file" >&2
+          exit 1
+      fi
+      printf '\n%s (%s)\n' "$name" "$license_id" >> "$LICENSES_OUTPUT"
+      printf '%0.s-' {1..80} >> "$LICENSES_OUTPUT"
+      printf '\n' >> "$LICENSES_OUTPUT"
+      cat "$license_file" >> "$LICENSES_OUTPUT"
+      printf '\n' >> "$LICENSES_OUTPUT"
+  done
+fi
+
+# LOCAL FORK: ship the program's own licence, not only its dependencies'.
+#
+# `THIRD_PARTY_LICENSES.txt` covers what Warp depends on and says nothing about
+# Warp itself. The bundle carried no copy of the AGPL at all --
+# `grep -rl "AFFERO GENERAL PUBLIC" WarpNine.app` returned nothing.
+#
+# AGPL-3.0 §6 conveys object code "under the terms of sections 4 and 5", and §4
+# requires giving all recipients a copy of the Licence along with the Program.
+# Somebody who downloads the disk image and never opens the repository is a
+# recipient. Publishing the source satisfies §6(d) -- object code and Corresponding
+# Source offered from the same place -- but §4 is a separate obligation that
+# publishing does not discharge.
+#
+# Deliberately outside the `NO_LICENSES` guard above. That flag exists so a missing
+# `cargo-about` cannot abort a local build, and generated third-party attribution is
+# a convenience. A file copy cannot fail for tooling reasons, and shipping without
+# the program's own licence is a violation rather than a missing nicety.
+for licence_file in LICENSE-AGPL LICENSE-MIT; do
+  if [ ! -f "$REPO_ROOT/$licence_file" ]; then
+    echo "Error: $licence_file is missing from the repository root." >&2
+    echo "       It has to ship inside the bundle; refusing to build without it." >&2
+    exit 1
+  fi
+  cp "$REPO_ROOT/$licence_file" "$DEST_DIR/$licence_file"
+done
+echo "Copied LICENSE-AGPL and LICENSE-MIT to $DEST_DIR"
+
+# Generate settings JSON schema unless explicitly skipped.
+if [ "${SKIP_SETTINGS_SCHEMA:-}" != "1" ]; then
+  SCHEMA_OUTPUT="$DEST_DIR/settings_schema.json"
+
+  if [ -n "${SETTINGS_SCHEMA_CACHE:-}" ] && [ -f "$SETTINGS_SCHEMA_CACHE" ]; then
+    echo "Copying cached settings schema to $SCHEMA_OUTPUT"
+    cp "$SETTINGS_SCHEMA_CACHE" "$SCHEMA_OUTPUT"
+  else
+    echo "Generating settings schema at $SCHEMA_OUTPUT"
+
+    # `generate_settings_schema` is a bin target of the `warp` package. Fall
+    # back to the workspace root if that manifest ever moves.
+    SCHEMA_MANIFEST="$REPO_ROOT/app/Cargo.toml"
+    if [ ! -f "$SCHEMA_MANIFEST" ]; then
+      SCHEMA_MANIFEST="$REPO_ROOT/Cargo.toml"
+    fi
+
+    SCHEMA_CMD=(cargo run)
+    if [ -n "$CARGO_PROFILE" ]; then
+      SCHEMA_CMD+=(--profile "$CARGO_PROFILE")
+    fi
+    # LOCAL FORK: build the schema generator with the same target triple *and*
+    # the same feature list as the app.
+    #
+    # Upstream passes neither. Without --target, cargo builds this helper for
+    # the host and writes to target/<profile>/ rather than
+    # target/<triple>/<profile>/, which is a separate artifact tree. Without
+    # --features it resolves the package's defaults, which differ from the
+    # app's feature set, so it produces a second ~600 MB libwarp plus its own
+    # copy of every dependency whose feature unification shifted. Between them
+    # that duplicated tree reached 5.6 GB on this fork, all to build a 2 MB
+    # helper.
+    #
+    # Matching features is also more correct on its own: the schema then
+    # describes the settings of the build actually being bundled, rather than
+    # of a default build nobody ships.
+    #
+    # The manifest path matters for the same reason. Pointing it at the virtual
+    # workspace root puts every default-member in the resolver's context, and
+    # under resolver v2 that unifies features differently than building from
+    # inside `app`, which is what `cargo bundle` does. Identical features,
+    # profile, target and rustflags still produced a distinct libwarp because 9
+    # of 252 workspace path-deps (ai, mcp, warp_terminal, onboarding,
+    # warp_server_client and friends) resolved to different feature sets.
+    # Naming app/Cargo.toml directly makes both invocations agree, so this step
+    # links against the app's artifacts rather than rebuilding them.
+    #
+    # --target is safe here only because we build for the host arch (see the
+    # arm64 default in script/macos/bundle). A genuine cross-compile would need
+    # a host binary, since this one is executed rather than shipped.
+    if [ -n "$CARGO_TARGET" ]; then
+      SCHEMA_CMD+=(--target "$CARGO_TARGET")
+    fi
+    if [ -n "$CARGO_FEATURES" ]; then
+      SCHEMA_CMD+=(--features "$CARGO_FEATURES")
+    fi
+    SCHEMA_CMD+=(--manifest-path "$SCHEMA_MANIFEST" --bin generate_settings_schema --)
+    if [ -n "$CHANNEL" ]; then
+      SCHEMA_CMD+=(--channel "$CHANNEL")
+    fi
+    SCHEMA_CMD+=("$SCHEMA_OUTPUT")
+
+    "${SCHEMA_CMD[@]}"
+
+    if [ -n "${SETTINGS_SCHEMA_CACHE:-}" ]; then
+      echo "Caching settings schema at $SETTINGS_SCHEMA_CACHE"
+      cp "$SCHEMA_OUTPUT" "$SETTINGS_SCHEMA_CACHE"
+    fi
+  fi
+fi
+
+echo "Successfully prepared bundled resources in $DEST_DIR"

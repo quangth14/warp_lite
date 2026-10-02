@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+#
+# LOCAL FORK: kept as the name this fork's notes and history refer to.
+#
+# The implementation moved to `script/release`, which does the same thing and adds a
+# preflight on the signing identity, a `--signed-only` mode for when the notary
+# credential is unavailable, an optional `--verify-first` pass, and a summary with
+# sizes and hashes.
+#
+# Usage is unchanged:
+#   script/notarize_release [profile-name]
+
+set -euo pipefail
+
+WORKSPACE_ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$WORKSPACE_ROOT_DIR"
+
+if [[ $# -gt 0 ]]; then
+  exec ./script/release --profile "$1"
+else
+  exec ./script/release
+fi
