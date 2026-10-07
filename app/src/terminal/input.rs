@@ -2994,11 +2994,24 @@ impl Input {
         // `@mention` token -- the fork has no AI agent, so the `@` menu is a file-path
         // picker. `@` is only the trigger; accepting replaces it (and the typed filter)
         // with the selected path.
-        let mut paths: Vec<_> = FileSearchModel::as_ref(ctx)
-            .get_repo_contents(&filter_text, ctx)
-            .iter()
-            .map(|result| format!("./{}", result.path))
-            .collect();
+        let file_search = FileSearchModel::as_ref(ctx);
+        let mut paths: Vec<_> = if file_search.repo_root_location(ctx).is_some() {
+            file_search
+                .get_repo_contents(&filter_text, ctx)
+                .iter()
+                .map(|result| format!("./{}", result.path))
+                .collect()
+        } else {
+            // LOCAL FORK: outside a git repo there is no detected repo root, so the
+            // repo-contents index is empty. Fall back to a non-recursive listing of the
+            // working directory so `@` still offers local files; the fuzzy step below
+            // filters it by `filter_text`.
+            file_search
+                .get_folder_contents(ctx)
+                .iter()
+                .map(|result| format!("./{}", result.path))
+                .collect()
+        };
         paths.sort_unstable();
 
         self.input_suggestions.update(ctx, |suggestions, ctx| {
