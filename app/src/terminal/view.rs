@@ -13213,11 +13213,22 @@ impl TerminalView {
 
     fn render_input(&self) -> Box<dyn Element> {
         let input = ChildView::new(&self.input).finish();
-        Hoverable::new(self.input_hoverable_handle.clone(), |_| input)
+        let input = Hoverable::new(self.input_hoverable_handle.clone(), |_| input)
             // We rely on the hover-out delay for the "Request edit access"
             // button UX for shared sessions.
             .with_hover_out_delay(Duration::from_millis(500))
-            .finish()
+            .finish();
+        // LOCAL FORK: make the command input a drop target so dragging a Project Explorer
+        // item onto it routes through `typed_characters_on_terminal`, like the block list
+        // above. At a shell prompt the path is inserted into the input; while a full-screen
+        // TUI (e.g. Claude Code) is running it is written to the PTY so the TUI receives it.
+        DropTarget::new(
+            input,
+            TerminalDropTargetData {
+                terminal_view: self.view_handle.clone(),
+            },
+        )
+        .finish()
     }
 
     fn render_inline_banners(
@@ -13387,7 +13398,7 @@ impl TerminalView {
             alt_screen_element,
         );
 
-        SavePosition::new(
+        let content = SavePosition::new(
             Container::new(
                 Align::new(
                     ConstrainedBox::new(
@@ -13406,6 +13417,18 @@ impl TerminalView {
             .with_vertical_padding(self.size_info.padding_y_px().as_f32())
             .finish(),
             &self.content_element_position_id,
+        )
+        .finish();
+
+        // LOCAL FORK: wrap the alt screen as a drop target so dragging a Project Explorer
+        // item onto a full-screen TUI (vim, k9s, Claude Code, ...) writes the file path to
+        // the PTY via `typed_characters_on_terminal`, the way the block list does for normal
+        // output. Without this the alt screen had no drop target, so drops were ignored.
+        DropTarget::new(
+            content,
+            TerminalDropTargetData {
+                terminal_view: self.view_handle.clone(),
+            },
         )
         .finish()
     }
